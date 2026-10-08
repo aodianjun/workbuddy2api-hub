@@ -87,6 +87,8 @@ jobs:
     # 同步失败（冲突等）不阻止按当前 main 构建；sync job 自身的失败在它那里可见
     if: always()
     runs-on: ubuntu-latest
+    # 卡住时不要占满默认的 6 小时（会一直占着 concurrency 组）
+    timeout-minutes: 45
     steps:
       - name: Checkout fork main
         uses: actions/checkout@v4
@@ -204,8 +206,28 @@ jobs:
         run: |
           set -eu
           mkdir -p .sdk-cache
-          curl -fL --retry 3 --retry-all-errors -o ".sdk-cache/${SDK_TARBALL}" "${SDK_URL}"
-          ls -l .sdk-cache/
+          OUT=".sdk-cache/${SDK_TARBALL}"
+          # 官方源在 runner 上可能极慢甚至卡死（实测一次挂了 25 分钟没动静），所以：
+          # 逐个镜像试，且"慢于 200KB/s 持续 60 秒"就判定为卡住换下一个。
+          ok=0
+          for base in \
+            "https://downloads.openwrt.org/releases/25.12.2/targets/x86/64" \
+            "https://mirror2.openwrt.org/releases/25.12.2/targets/x86/64" \
+            "https://mirrors.tuna.tsinghua.edu.cn/openwrt/releases/25.12.2/targets/x86/64" \
+            "https://mirrors.ustc.edu.cn/openwrt/releases/25.12.2/targets/x86/64"
+          do
+            echo "== 尝试镜像: ${base}"
+            if curl -fL --retry 2 --retry-all-errors --connect-timeout 20 \
+                 --max-time 1200 --speed-time 60 --speed-limit 204800 \
+                 -o "$OUT" "${base}/${SDK_TARBALL}"; then
+              ok=1
+              break
+            fi
+            echo "::warning::该镜像失败或过慢，换下一个"
+            rm -f "$OUT"
+          done
+          [ "$ok" = "1" ] || { echo "::error::所有镜像都没能下到 SDK（${SDK_TARBALL}）"; exit 1; }
+          ls -l "$OUT"
 
       - name: Extract SDK
         if: steps.rel.outputs.skip != 'true'
