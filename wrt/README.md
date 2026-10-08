@@ -53,6 +53,17 @@ Contents API、GraphQL 全部会被 GitHub 拒绝（tree 创建返回 404，merg
 
 激活后可以删掉 `wrt/ci/` 里的副本（保留也无妨，不会被当成工作流）。
 
+另外两点：
+
+- **Actions 启用**：fork 默认不跑工作流（Actions 页会出现 "Workflows aren't being run
+  on this forked repository" 横幅）。本仓库已于 2026-10-08 通过 API 启用
+  （`PUT /repos/.../actions/permissions` → `{"enabled": true}`，实测之后 push /
+  workflow_dispatch 事件都能正常触发）。若横幅再次出现，在 Actions 页点一次启用即可。
+- **`tests.yml` 的差异**：fork 里上游的 `.github/workflows/tests.yml` 比上游当前版本旧
+  一个提交（2026-10-08 的同步因 token 没有 workflow 作用域，保留了 fork 版本）。那是
+  上游自己的测试 CI，与本目录两个工作流无关。下次上游再改 `.github/workflows/*` 时，
+  同步会以 422 失败并提示，用带 `workflow` 作用域的 token 或网页 Sync fork 即可解决。
+
 ## CI 说明（激活后生效）
 
 - **`wrt-sync-upstream.yml`**：每天 03:23 UTC 调一次 `POST /repos/.../merge-upstream`
