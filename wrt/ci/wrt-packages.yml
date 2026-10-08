@@ -1,0 +1,412 @@
+name: wrt-packages
+
+# 构建 OpenWrt 安装包并挂到 fork 的 release 上（下载即可用）：
+#   - .ipk（opkg 系，OpenWrt <= 24.10）：wrt/openwrt/build-ipk.sh，纯 POSIX sh + python3，无需 SDK
+#   - .apk（apk-tools 3，OpenWrt 25.x）：wrt/openwrt/build-apk.sh + OpenWrt 25.12.2 x86-64 SDK
+#
+# 版本取自 wb_proxy.py 的 server_version 与 wrt/openwrt/workbuddy2api/Makefile 的
+# PKG_VERSION / PKG_RELEASE，release tag 形如 wrt-1.6.16-1。
+#
+# 幂等：tag 已存在且 .apk / .ipk 资产齐全 -> 直接跳过（job 成功退出），重复运行不会
+# 产生重复 release 或重复资产；资产不全时只构建/补传缺失的那部分。
+#
+# 签名：CI 默认没有私钥 -> .apk 不签名（安装用 apk add --allow-untrusted）。
+#       配置 secret WRT_SIGNING_KEY（PEM 私钥全文）后，用 SDK 自带 apk adbsign 签名并 verify。
+#
+# 注意：GITHUB_TOKEN 推送不触发其它 workflow（防递归机制），所以本文件把同步和构建
+# 放在一起：schedule / workflow_dispatch / push 都会先同步上游再构建；构建用
+# if: always()，同步失败（如上游冲突）也照常按当前 main 的状态构建。
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '37 4 * * *'   # 每天 04:37 UTC（北京时间 12:37）
+  push:
+    branches: [main]
+    paths:
+      - 'wrt/**'
+      - 'wb_*.py'
+      - 'dashboard.html'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wrt-packages
+  cancel-in-progress: false
+
+env:
+  SDK_TARBALL: openwrt-sdk-25.12.2-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  SDK_URL: https://downloads.openwrt.org/releases/25.12.2/targets/x86/64/openwrt-sdk-25.12.2-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+
+jobs:
+  sync:
+    name: Sync fork with upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call merge-upstream API (same as the "Sync fork" button)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WRT_SYNC_TOKEN: ${{ secrets.WRT_SYNC_TOKEN }}
+        run: |
+          set -u
+          TOKEN="${WRT_SYNC_TOKEN:-$GH_TOKEN}"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/merge-upstream"
+          http=$(curl -sS --retry 3 -o /tmp/merge.json -w '%{http_code}' \
+            -X POST "$API" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "User-Agent: wrt-packages" \
+            -d '{"branch":"main"}')
+          echo "merge-upstream -> HTTP ${http}"
+          cat /tmp/merge.json; echo
+          msg=$(jq -r '.message // empty' /tmp/merge.json 2>/dev/null || true)
+          case "$http" in
+            200)
+              echo "::notice::fork sync ok: ${msg}" ;;
+            409)
+              echo "::error::fork sync conflict (HTTP 409): ${msg}"
+              echo "::error::上游改动与 fork 本地改动冲突，无法自动合并；请手动解决（本地 merge 后 push，或在网页 Sync fork）。构建仍会按当前 main 继续。"
+              exit 1 ;;
+            422)
+              echo "::error::fork sync refused (HTTP 422): ${msg}"
+              echo "::error::若信息提到 workflow 作用域：上游改动了 .github/workflows/ 下的文件，而当前 token 没有 workflow 作用域。请配置带 workflow 作用域的 PAT（secret WRT_SYNC_TOKEN），或在网页上点 Sync fork。构建仍会按当前 main 继续。"
+              exit 1 ;;
+            *)
+              echo "::error::merge-upstream failed (HTTP ${http}): ${msg}"
+              exit 1 ;;
+          esac
+
+  build:
+    name: Build packages and publish release
+    needs: [sync]
+    # 同步失败（冲突等）不阻止按当前 main 构建；sync job 自身的失败在它那里可见
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Determine versions (app / Makefile / pin)
+        id: ver
+        run: |
+          set -eu
+          APP_VER=$(sed -n 's/.*server_version = "wb-proxy\/\([0-9.]*\)".*/\1/p' wb_proxy.py | head -n1)
+          PKG_VERSION=$(sed -n 's/^PKG_VERSION:=//p' wrt/openwrt/workbuddy2api/Makefile | head -n1)
+          PKG_RELEASE=$(sed -n 's/^PKG_RELEASE:=//p' wrt/openwrt/workbuddy2api/Makefile | head -n1)
+          PIN_VER=$(sed -n 's/^PIN_VER="\([0-9.]*\)".*/\1/p' wrt/openwrt/build-apk.sh | head -n1)
+          [ -n "$APP_VER" ] && [ -n "$PKG_VERSION" ] && [ -n "$PKG_RELEASE" ] && [ -n "$PIN_VER" ] || {
+            echo "::error::版本号解析失败（app='$APP_VER' pkg='$PKG_VERSION-$PKG_RELEASE' pin='$PIN_VER'）"
+            exit 1
+          }
+          TAG="wrt-${PKG_VERSION}-${PKG_RELEASE}"
+          {
+            echo "app_ver=$APP_VER"
+            echo "pkg_version=$PKG_VERSION"
+            echo "pkg_release=$PKG_RELEASE"
+            echo "pin_ver=$PIN_VER"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "app=$APP_VER  Makefile=$PKG_VERSION-$PKG_RELEASE  pin=$PIN_VER  tag=$TAG"
+
+      - name: Check release exists (idempotence)
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="${{ steps.ver.outputs.tag }}"
+          http=$(curl -sS --retry 3 -o /tmp/rel.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: wrt-packages" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+          echo "GET releases/tags/${TAG} -> HTTP ${http}"
+          if [ "$http" = "200" ]; then
+            echo "release_id=$(jq -r '.id' /tmp/rel.json)" >> "$GITHUB_OUTPUT"
+            jq -r '.assets[].name' /tmp/rel.json || true
+            n_apk=$(jq '[.assets[]? | select(.name | endswith(".apk"))] | length' /tmp/rel.json)
+            n_ipk=$(jq '[.assets[]? | select(.name | endswith(".ipk"))] | length' /tmp/rel.json)
+            if [ "$n_apk" -ge 1 ] && [ "$n_ipk" -ge 1 ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::release ${TAG} 已存在且 .apk/.ipk 资产齐全（apk x$n_apk, ipk x$n_ipk）——跳过构建，不做任何改动"
+            else
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::release ${TAG} 已存在但资产不全（apk x$n_apk, ipk x$n_ipk）——只构建/补传缺失的部分"
+            fi
+          elif [ "$http" = "404" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "release ${TAG} 不存在，将新建"
+          else
+            echo "::error::查询 release 失败 HTTP ${http}"
+            cat /tmp/rel.json
+            exit 1
+          fi
+
+      # ---------- .ipk（opkg 系，OpenWrt <= 24.10）----------
+
+      - name: Build .ipk
+        id: ipk
+        if: steps.rel.outputs.skip != 'true'
+        run: |
+          set -eu
+          APP_VER="${{ steps.ver.outputs.app_ver }}"
+          PIN_VER="${{ steps.ver.outputs.pin_ver }}"
+          PKG_VERSION="${{ steps.ver.outputs.pkg_version }}"
+          if [ "$APP_VER" != "$PIN_VER" ] || [ "$APP_VER" != "$PKG_VERSION" ]; then
+            echo "::warning::跳过 .ipk 构建：源码版本=$APP_VER，build-ipk.sh 的 PIN_VER=$PIN_VER，Makefile PKG_VERSION=$PKG_VERSION（三者需一致，脚本会拒绝打包不一致的版本）。升级时请同步修改脚本顶部 PIN_SHA/PIN_VER 与 Makefile。"
+            echo "ipk_ok=false" >> "$GITHUB_OUTPUT"
+          elif sh wrt/openwrt/build-ipk.sh --app-src "$GITHUB_WORKSPACE"; then
+            echo "ipk_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::.ipk 构建失败（见上方日志）"
+            echo "ipk_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- .apk（apk-tools 3，OpenWrt 25.x）----------
+
+      - name: Cache OpenWrt SDK tarball
+        id: sdk-cache
+        if: steps.rel.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: .sdk-cache
+          key: openwrt-sdk-25.12.2-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+
+      - name: Download OpenWrt 25.12.2 x86-64 SDK (cache miss only)
+        if: steps.rel.outputs.skip != 'true' && steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          mkdir -p .sdk-cache
+          curl -fL --retry 3 --retry-all-errors -o ".sdk-cache/${SDK_TARBALL}" "${SDK_URL}"
+          ls -l .sdk-cache/
+
+      - name: Extract SDK
+        if: steps.rel.outputs.skip != 'true'
+        run: |
+          set -eu
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y zstd
+          fi
+          mkdir -p "$RUNNER_TEMP/sdk"
+          tar --zstd -xf ".sdk-cache/${SDK_TARBALL}" -C "$RUNNER_TEMP/sdk"
+          SDK_DIR=$(find "$RUNNER_TEMP/sdk" -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n1)
+          [ -f "$SDK_DIR/rules.mk" ] || { echo "::error::SDK 解压结果不对: $SDK_DIR"; exit 1; }
+          echo "SDK_DIR=${SDK_DIR}" >> "$GITHUB_ENV"
+          echo "SDK ok: $SDK_DIR"
+
+      - name: Stage app source into wrt/app-src (so build-apk.sh needs no network)
+        if: steps.rel.outputs.skip != 'true'
+        run: |
+          set -eu
+          mkdir -p wrt/app-src
+          cp wb_*.py dashboard.html wrt/app-src/
+          ls wrt/app-src/
+
+      - name: Build .apk
+        id: apk
+        if: steps.rel.outputs.skip != 'true'
+        run: |
+          set -eu
+          APP_VER="${{ steps.ver.outputs.app_ver }}"
+          PIN_VER="${{ steps.ver.outputs.pin_ver }}"
+          PKG_VERSION="${{ steps.ver.outputs.pkg_version }}"
+          if [ "$APP_VER" != "$PIN_VER" ] || [ "$APP_VER" != "$PKG_VERSION" ]; then
+            echo "::warning::跳过 .apk 构建：源码版本=$APP_VER，build-apk.sh 的 PIN_VER=$PIN_VER，Makefile PKG_VERSION=$PKG_VERSION（三者需一致，脚本会拒绝打包不一致的版本）。升级时请同步修改脚本顶部 PIN_SHA/PIN_VER 与 Makefile。"
+            echo "apk_ok=false" >> "$GITHUB_OUTPUT"
+          elif sh wrt/openwrt/build-apk.sh "$SDK_DIR"; then
+            echo "apk_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::.apk 构建失败（见上方日志）"
+            echo "apk_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Normalize .apk file name (maintainer convention: name-ver-rrel.apk)"
+        if: steps.rel.outputs.skip != 'true' && steps.apk.outputs.apk_ok == 'true'
+        run: |
+          set -eu
+          src=$(ls wrt/apk/*.apk | head -n1)
+          dst="wrt/apk/workbuddy2api-${{ steps.ver.outputs.pkg_version }}-r${{ steps.ver.outputs.pkg_release }}.apk"
+          if [ "$src" != "$dst" ]; then mv "$src" "$dst"; fi
+          ls -l wrt/apk/
+
+      - name: Sign .apk if WRT_SIGNING_KEY secret is configured
+        id: sign
+        if: steps.rel.outputs.skip != 'true' && steps.apk.outputs.apk_ok == 'true'
+        env:
+          WRT_SIGNING_KEY: ${{ secrets.WRT_SIGNING_KEY }}
+        run: |
+          set -eu
+          if [ -z "${WRT_SIGNING_KEY:-}" ]; then
+            echo "未配置 WRT_SIGNING_KEY —— .apk 保持未签名（安装需 apk add --allow-untrusted <文件>）"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          APK_BIN="$SDK_DIR/staging_dir/host/bin/apk"
+          [ -x "$APK_BIN" ] || { echo "::error::找不到 SDK 的 apk 工具: $APK_BIN"; exit 1; }
+          KEY="$RUNNER_TEMP/wrt-signing.key"
+          printf '%s\n' "$WRT_SIGNING_KEY" > "$KEY"
+          chmod 600 "$KEY"
+          OSSL="$SDK_DIR/staging_dir/host/bin/openssl"
+          [ -x "$OSSL" ] || OSSL=openssl
+          PUB="$RUNNER_TEMP/wrt-signing.pub"
+          "$OSSL" pkey -in "$KEY" -pubout > "$PUB"
+          KEYS_DIR="$RUNNER_TEMP/keys"
+          mkdir -p "$KEYS_DIR"
+          cp "$PUB" "$KEYS_DIR/"
+          for f in wrt/apk/*.apk; do
+            "$APK_BIN" --allow-untrusted adbsign --sign-key "$KEY" "$f"
+            "$APK_BIN" --keys-dir "$KEYS_DIR" verify "$f"
+          done
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      # ---------- 发布 ----------
+
+      - name: Publish release and upload missing assets
+        if: steps.rel.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="${{ steps.ver.outputs.tag }}"
+          SIGNED="${{ steps.sign.outputs.signed }}"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+
+          shopt -s nullglob
+          arts=(wrt/ipk/*.ipk wrt/apk/*.apk)
+          shopt -u nullglob
+          echo "构建产物: ${arts[*]:-无}"
+          apk_name=""
+          ipk_name=""
+          for f in "${arts[@]}"; do
+            case "$f" in
+              *.apk) apk_name=$(basename "$f") ;;
+              *.ipk) ipk_name=$(basename "$f") ;;
+            esac
+          done
+
+          # 重新取一次 release 的最新状态（可能与前面的检查之间被别的 run 改过）
+          http=$(curl -sS --retry 3 -o /tmp/rel2.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: wrt-packages" \
+            "$API/releases/tags/${TAG}")
+          REL_ID=""
+          if [ "$http" = "200" ]; then
+            REL_ID=$(jq -r '.id' /tmp/rel2.json)
+            echo "release ${TAG} 已存在 id=${REL_ID}"
+          elif [ "$http" = "404" ]; then
+            echo "release ${TAG} 不存在"
+          else
+            echo "::error::查询 release 失败 HTTP ${http}"
+            exit 1
+          fi
+
+          if [ -z "$REL_ID" ] && [ "${#arts[@]}" -eq 0 ]; then
+            echo "::error::没有构建出任何产物，且 release ${TAG} 不存在——无可发布内容"
+            exit 1
+          fi
+
+          if [ -z "$REL_ID" ]; then
+            {
+              echo "WorkBuddy2API-Hub 的 OpenWrt 安装包（由 fork aodianjun/workbuddy2api-hub 的 CI 自动构建）"
+              echo ""
+              echo "源码版本：wb-proxy/${{ steps.ver.outputs.app_ver }} · 包版本：${{ steps.ver.outputs.pkg_version }}-${{ steps.ver.outputs.pkg_release }} · 构建自 main@${GITHUB_SHA:0:12}"
+              echo ""
+              echo "## 文件说明"
+              if [ -n "$apk_name" ]; then
+                if [ "$SIGNED" = "true" ]; then
+                  echo "- ${apk_name} —— 给 OpenWrt 25.x（apk-tools 3）的 apk 包，已用 WRT_SIGNING_KEY 签名"
+                else
+                  echo "- ${apk_name} —— 给 OpenWrt 25.x（apk-tools 3）的 apk 包，未签名（CI 没有签名私钥）"
+                fi
+              fi
+              if [ -n "$ipk_name" ]; then
+                echo "- ${ipk_name} —— 给 opkg 系统（OpenWrt 24.10 及更早）的 ipk 包"
+              fi
+              echo ""
+              echo "两个包内容相同：wb_*.py + dashboard.html（纯 Python 标准库）+ /etc/init.d/workbuddy2api + uci 配置 + 自动更新/预热脚本。"
+              echo ""
+              echo "## 依赖"
+              echo "python3-light、python3-urllib、python3-uuid（两套系统包名相同）"
+              echo ""
+              echo "## 安装"
+              if [ -n "$apk_name" ]; then
+                if [ "$SIGNED" = "true" ]; then
+                  echo "apk 包（已签名；设备上装好对应公钥后可直接装，没有公钥就加 --allow-untrusted）："
+                else
+                  echo "apk 包（未签名，必须加 --allow-untrusted）："
+                fi
+                echo "  apk add --allow-untrusted ./${apk_name}"
+                echo ""
+              fi
+              if [ -n "$ipk_name" ]; then
+                echo "ipk 包："
+                echo "  opkg install ./${ipk_name}"
+                echo ""
+              fi
+              echo "装完后："
+              echo "  uci set workbuddy2api.main.panel_password='你的面板密码' && uci commit workbuddy2api"
+              echo "  /etc/init.d/workbuddy2api enable && /etc/init.d/workbuddy2api start"
+              echo "  浏览器打开 http://<路由器IP>:8788/ 登录并添加账号（OAuth）"
+              echo ""
+              echo "## 其他"
+              echo "- 上游项目：https://github.com/ardeyouxipianyi/workbuddy2api-hub"
+              echo "- 本 release 由 fork 的 wrt-packages.yml 自动构建/更新，重复运行不会重复上传资产"
+            } > /tmp/body.md
+            jq -n --rawfile body /tmp/body.md --arg tag "$TAG" \
+              '{tag_name:$tag, name:$tag, body:$body, prerelease:false, draft:false, target_commitish:"main"}' > /tmp/newrel.json
+            http=$(curl -sS -o /tmp/created.json -w '%{http_code}' \
+              -X POST "$API/releases" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "User-Agent: wrt-packages" \
+              --data-binary @/tmp/newrel.json)
+            echo "POST releases -> HTTP ${http}"
+            if [ "$http" = "201" ]; then
+              REL_ID=$(jq -r '.id' /tmp/created.json)
+              echo "release 创建成功 id=${REL_ID}"
+            elif [ "$http" = "422" ] && grep -q already_exists /tmp/created.json; then
+              REL_ID=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "$API/releases/tags/${TAG}" | jq -r '.id')
+              echo "release 已被并发创建 id=${REL_ID}"
+            else
+              echo "::error::创建 release 失败 HTTP ${http}"
+              cat /tmp/created.json
+              exit 1
+            fi
+          fi
+
+          for f in "${arts[@]}"; do
+            name=$(basename "$f")
+            if jq -e --arg n "$name" '.assets[]? | select(.name==$n)' /tmp/rel2.json >/dev/null 2>&1; then
+              echo "资产 ${name} 已存在，跳过"
+              continue
+            fi
+            http=$(curl -sS -o /tmp/up.json -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              -H "User-Agent: wrt-packages" \
+              --data-binary @"$f" \
+              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${REL_ID}/assets?name=${name}")
+            echo "上传 ${name} -> HTTP ${http}"
+            if [ "$http" = "201" ]; then
+              echo "  已上传 ${name}"
+            elif [ "$http" = "422" ] && grep -q already_exists /tmp/up.json; then
+              echo "  资产 ${name} 已存在（并发），跳过"
+            else
+              echo "::error::上传 ${name} 失败 HTTP ${http}"
+              cat /tmp/up.json
+              exit 1
+            fi
+          done
+
+          echo "完成：https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
