@@ -1,0 +1,451 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""workbuddy2api 包更新器（OpenWrt 版）
+
+与应用更新器（workbuddy2api-update）分工不同：
+  * 应用更新器：从**上游** release 拉 wb_*.py + dashboard.html，换 /usr/lib/workbuddy2api
+    下的程序文件——这条链路随时可用、每天跑。
+  * 本脚本：从**自己的 fork** release 拉**打包好的 .apk**（含 init 脚本 / uci 默认值 /
+    更新器与预热器本身），用 apk 安装——包层面的东西（服务脚本、默认配置、工具）
+    只有走这条链路才会更新。
+
+为什么走 API 而不是 release 下载页：本机网络挡了 github.com（实测 30 秒超时），但
+api.github.com 可达；资产端点 `.../releases/assets/<id>`（Accept: octet-stream）
+能正常下载。完整性用接口自带的 digest（sha256）校验。
+
+流程：查 fork 最新 release -> 与已装版本比较 -> 防降级护栏 -> 下载 .apk -> 校验 sha256
+      -> apk add -> 重启服务 -> 健康检查 -> 失败自动装回上一版
+
+用法：
+  workbuddy2api-pkgupdate              检查并更新（有新版本才动）
+  workbuddy2api-pkgupdate --check      只检查；有更新退出码 10，无更新 0
+  workbuddy2api-pkgupdate --force      无视版本比较，重装最新包
+  workbuddy2api-pkgupdate --rollback   装回本地保留的上一版包
+  workbuddy2api-pkgupdate --quiet      cron 用：只写 syslog
+
+配置（uci workbuddy2api.main）：
+  pkg_auto_update  0/1，默认 1
+  pkg_repo         取包的仓库，默认 aodianjun/workbuddy2api-hub
+  pkg_allow_untrusted  1 = apk add 加 --allow-untrusted（CI 产的包未签名时必需，默认 1）
+
+退出码：0 正常 / 10 有新版本（--check）/ 1 出错（失败时已尝试回滚）
+
+测试用环境变量（生产环境不要设）：WB2API_PKG_API_BASE / WB2API_PKG_STATE_DIR /
+WB2API_PKG_CACHE_DIR / WB2API_PKG_STATE_FILE / WB2API_PKG_LOCK_FILE /
+WB2API_PKG_SERVICE / WB2API_PKG_HEALTH_URL / WB2API_PKG_HEALTH_TIMEOUT /
+WB2API_PKG_APK / WB2API_PKG_UCI / WB2API_PKG_APP_FILE / WB2API_PKG_PGREP
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+PKG_NAME = os.environ.get("WB2API_PKG_NAME", "workbuddy2api")
+API_BASE = os.environ.get("WB2API_PKG_API_BASE", "https://api.github.com")
+STATE_DIR = os.environ.get("WB2API_PKG_STATE_DIR", "/etc/workbuddy2api")
+PKG_CACHE = os.environ.get("WB2API_PKG_CACHE_DIR", os.path.join(STATE_DIR, "pkgs"))
+STATE_FILE = os.environ.get("WB2API_PKG_STATE_FILE",
+                           os.path.join(STATE_DIR, "pkg-update-state.json"))
+LOCK_FILE = os.environ.get("WB2API_PKG_LOCK_FILE", "/var/lock/workbuddy2api-pkgupdate.lock")
+SERVICE = os.environ.get("WB2API_PKG_SERVICE", "/etc/init.d/workbuddy2api")
+HEALTH_URL = os.environ.get("WB2API_PKG_HEALTH_URL", "http://127.0.0.1:%s/health")
+APP_FILE = os.environ.get("WB2API_PKG_APP_FILE", "/usr/lib/workbuddy2api/wb_proxy.py")
+APK_BIN = os.environ.get("WB2API_PKG_APK", "apk")
+UCI_BIN = os.environ.get("WB2API_PKG_UCI", "uci")
+PGREP_BIN = os.environ.get("WB2API_PKG_PGREP_BIN", "pgrep")
+SERVICE_PGREP = os.environ.get("WB2API_PKG_PGREP", "wb_proxy.py")
+HEALTH_TIMEOUT = int(os.environ.get("WB2API_PKG_HEALTH_TIMEOUT", "40") or 40)
+UA = {"User-Agent": "workbuddy2api-wrt-pkgupdate/1.0"}
+KEEP_APKS = 3
+
+
+def log(msg, quiet=False):
+    if not quiet:
+        sys.stdout.write("[pkgupdate] %s\n" % msg)
+        sys.stdout.flush()
+    try:
+        subprocess.run(["logger", "-t", "workbuddy2api-pkgupdate", msg], timeout=10)
+    except Exception:
+        pass
+
+
+def uci_get(option, default=None):
+    try:
+        out = subprocess.run([UCI_BIN, "get", "workbuddy2api.main.%s" % option],
+                             capture_output=True, text=True, timeout=10)
+        v = out.stdout.strip()
+        return v if out.returncode == 0 and v else default
+    except Exception:
+        return default
+
+
+def installed_version():
+    """返回 (version, release) 或 (None, None)。apk list 输出形如
+    workbuddy2api-1.6.16-r1 noarch {feeds/base/workbuddy2api} (MIT) [installed]"""
+    try:
+        out = subprocess.run([APK_BIN, "list", "--installed"], capture_output=True,
+                             text=True, timeout=30)
+        for line in (out.stdout or "").splitlines():
+            m = re.match(r"^%s-([0-9][0-9.]*)-r([0-9]+)\s" % re.escape(PKG_NAME), line)
+            if m:
+                return m.group(1), m.group(2)
+    except Exception as exc:
+        log("读取已装版本失败: %r" % exc, True)
+    return None, None
+
+
+def installed_app_version():
+    """当前 /usr/lib/workbuddy2api 里应用文件的版本号（防降级护栏用）。"""
+    try:
+        with open(APP_FILE, encoding="utf-8", errors="replace") as fh:
+            m = re.search(r'server_version = "wb-proxy/([0-9.]+)"', fh.read())
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def vtuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except Exception:
+        return (0,)
+
+
+def _release_json(url):
+    req = urllib.request.Request(url, headers=dict(UA, Accept="application/vnd.github+json"))
+    with urllib.request.urlopen(req, timeout=30) as r:
+        d = json.load(r)
+    tag = str(d.get("tag_name") or "").strip()
+    assets = [{"name": a.get("name"), "id": a.get("id"), "size": a.get("size"),
+               "digest": (a.get("digest") or "")} for a in (d.get("assets") or [])]
+    return tag, assets
+
+
+def fetch_latest(repo):
+    """返回 (tag, assets) —— assets 为 [{name,id,size,digest}]。"""
+    return _release_json("%s/repos/%s/releases/latest" % (API_BASE, repo))
+
+
+def fetch_release_by_tag(repo, tag):
+    return _release_json("%s/repos/%s/releases/tags/%s" % (API_BASE, repo, tag))
+
+
+def parse_tag(tag):
+    """wrt-1.6.17-2 -> ("1.6.17", "2")；不是本项目的包 tag 时返回 (None, None)。"""
+    m = re.match(r"^wrt-([0-9][0-9.]*)-([0-9]+)$", str(tag or ""))
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+
+def download_asset(repo, asset, dest):
+    """走 API 资产端点下载（github.com 直连在本网络不可达）。返回 sha256。"""
+    url = "%s/repos/%s/releases/assets/%s" % (API_BASE, repo, asset["id"])
+    req = urllib.request.Request(url, headers=dict(UA, Accept="application/octet-stream"))
+    with urllib.request.urlopen(req, timeout=180) as resp, open(dest, "wb") as fh:
+        shutil.copyfileobj(resp, fh, 64 * 1024)
+    size = os.path.getsize(dest)
+    if asset.get("size") and size != asset["size"]:
+        raise RuntimeError("大小不符：期望 %s，实际 %d" % (asset["size"], size))
+    with open(dest, "rb") as fh:
+        got = hashlib.sha256(fh.read()).hexdigest()
+    want = (asset.get("digest") or "").replace("sha256:", "")
+    if want and got != want:
+        raise RuntimeError("sha256 不符：接口 digest=%s，实际=%s" % (want[:16], got[:16]))
+    return got
+
+
+def health(port, timeout=None):
+    timeout = HEALTH_TIMEOUT if timeout is None else timeout
+    url = HEALTH_URL % port if "%s" in HEALTH_URL else HEALTH_URL
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def service_running():
+    try:
+        out = subprocess.run([PGREP_BIN, "-f", SERVICE_PGREP], capture_output=True,
+                             text=True, timeout=10)
+        return out.returncode == 0 and bool(out.stdout.strip())
+    except Exception:
+        return False
+
+
+def apk_install(path, allow_untrusted=True):
+    cmd = [APK_BIN, "add"]
+    if allow_untrusted:
+        cmd.append("--allow-untrusted")
+    cmd.append(path)
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    return out.returncode, (out.stdout or "") + (out.stderr or "")
+
+
+def cached_apks():
+    if not os.path.isdir(PKG_CACHE):
+        return []
+    items = [os.path.join(PKG_CACHE, f) for f in os.listdir(PKG_CACHE) if f.endswith(".apk")]
+    items.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return items
+
+
+def cache_path(v, r):
+    """缓存文件名必须带包名前缀：apk_version_of() 靠它认版本（少了前缀会导致
+    回滚时认不出「当前版本」，把坏包又装一遍）。"""
+    return os.path.join(PKG_CACHE, "%s-%s-r%s.apk" % (PKG_NAME, v, r))
+
+
+def apk_version_of(path):
+    """从缓存文件名 workbuddy2api-1.6.16-r1.apk 解析出 ("1.6.16", "1")。"""
+    m = re.match(r"^%s-([0-9][0-9.]*)-r([0-9]+)\.apk$" % re.escape(PKG_NAME),
+                 os.path.basename(path))
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def ensure_rollback_target(repo, cur_v, cur_r, quiet):
+    """把「当前已装版本」的 .apk 备到缓存里，作为回滚目标。
+
+    缓存里只有本更新器下载过的包——首次更新时旧包并不在缓存里，一旦新包装坏就
+    无路可退。这里按 wrt-<版本>-<修订> 标签去 fork 的 release 里补一份；补不到
+    就如实告警（仍继续，只是没有自动回滚能力）。
+    """
+    dest = cache_path(cur_v, cur_r)
+    if os.path.isfile(dest):
+        return dest
+    tag = "wrt-%s-%s" % (cur_v, cur_r)
+    try:
+        _, assets = fetch_release_by_tag(repo, tag)
+        asset = next((a for a in assets if str(a["name"]).endswith(".apk")), None)
+        if not asset:
+            log("回滚包缺失：release %s 里没有 .apk" % tag, quiet)
+            return None
+        download_asset(repo, asset, dest + ".part")
+        os.replace(dest + ".part", dest)
+        log("已备好回滚包 %s" % os.path.basename(dest), quiet)
+        return dest
+    except Exception as exc:
+        log("回滚包缺失（取 %s 失败：%s）——本次若装坏需手工处理" % (tag, exc), quiet)
+        return None
+
+
+def prune_cache():
+    for old in cached_apks()[KEEP_APKS:]:
+        try:
+            os.remove(old)
+        except Exception:
+            pass
+
+
+def restart_service():
+    try:
+        subprocess.run([SERVICE, "restart"], capture_output=True, timeout=120)
+    except Exception as exc:
+        log("重启服务出错: %r" % (exc,), True)
+
+
+def rollback(port, quiet):
+    """装回缓存里最新的一版「不是当前已装版本」的包。"""
+    cur_v, cur_r = installed_version()
+    cands = [p for p in cached_apks() if apk_version_of(p) != (cur_v, cur_r)]
+    if not cands:
+        log("回滚失败：缓存里没有可回退的包（%s）" % PKG_CACHE, quiet)
+        return False
+    prev = cands[0]
+    log("回滚：安装 %s" % os.path.basename(prev), quiet)
+    rc, out = apk_install(prev)
+    if rc != 0:
+        log("回滚安装失败：%s" % out.strip()[-300:], quiet)
+        return False
+    restart_service()
+    ok = health(port)
+    v, r = installed_version()
+    log("回滚%s（当前 %s-r%s）" % ("成功" if ok else "后健康检查仍失败，请人工检查",
+                                  v or "?", r or "?"), quiet)
+    return ok
+
+
+def write_state(record):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        log("状态文件写入失败: %s" % exc, True)
+
+
+def acquire_lock():
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, str(os.getpid()).encode())
+        return fd
+    except FileExistsError:
+        try:
+            with open(LOCK_FILE) as fh:
+                pid = int(fh.read().strip() or 0)
+        except Exception:
+            pid = 0
+        if pid and os.path.isdir("/proc/%d" % pid):
+            return None
+        try:
+            os.remove(LOCK_FILE)
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            return fd
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--check", action="store_true", help="只检查，有更新退出码 10")
+    ap.add_argument("--force", action="store_true", help="无视版本比较，重装最新包")
+    ap.add_argument("--rollback", action="store_true", help="装回本地保留的上一版包")
+    ap.add_argument("--quiet", action="store_true", help="只写 syslog")
+    args = ap.parse_args()
+    quiet = args.quiet
+    port = uci_get("port", "8788")
+    now = lambda: time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    if args.rollback:
+        return 0 if rollback(port, quiet) else 1
+
+    if not args.force and uci_get("pkg_auto_update", "1") == "0":
+        log("包自动更新已在 uci 里关闭（workbuddy2api.main.pkg_auto_update=0），跳过", quiet)
+        return 0
+
+    lock = acquire_lock()
+    if lock is None:
+        log("已有另一个包更新进程在跑，跳过", quiet)
+        return 0
+    try:
+        repo = uci_get("pkg_repo", "aodianjun/workbuddy2api-hub")
+        allow_untrusted = uci_get("pkg_allow_untrusted", "1") != "0"
+        cur_v, cur_r = installed_version()
+        if not cur_v:
+            log("读不到已装版本（apk list 里没有 %s），跳过" % PKG_NAME, quiet)
+            return 1
+        log("已装 %s-r%s，查 %s 的最新 release ..." % (cur_v, cur_r, repo), quiet)
+
+        try:
+            tag, assets = fetch_latest(repo)
+        except Exception as exc:
+            log("查询 GitHub 失败（网络/限流？）：%s —— 本次跳过" % exc, quiet)
+            return 0
+        new_v, new_r = parse_tag(tag)
+        if not new_v:
+            log("最新 release 的 tag（%s）不是本项目的包，跳过" % tag, quiet)
+            return 0
+        log("最新包 %s-r%s（tag %s）" % (new_v, new_r, tag), quiet)
+
+        newer = (vtuple(new_v), int(new_r)) > (vtuple(cur_v), int(cur_r))
+        if not newer and not args.force:
+            log("已是最新（%s-r%s），无需更新" % (cur_v, cur_r), quiet)
+            write_state({"installed": "%s-r%s" % (cur_v, cur_r), "latest_seen": tag,
+                         "checked_at": now(), "result": "up_to_date"})
+            return 0
+
+        # 防降级护栏：包会把 /usr/lib/workbuddy2api 的应用文件覆盖成「包内版本」，
+        # 而应用更新器可能已经跑到了更新的版本（tag 里就写着包内应用版本）。
+        app_now = installed_app_version()
+        if app_now and vtuple(new_v) < vtuple(app_now) and not args.force:
+            log("跳过：包内应用版本 %s 低于当前应用文件版本 %s，装了会把应用降级"
+                "（等 fork 构建出 ≥%s 的包；要强行装用 --force）" % (new_v, app_now, app_now), quiet)
+            write_state({"installed": "%s-r%s" % (cur_v, cur_r), "latest_seen": tag,
+                         "app_now": app_now, "checked_at": now(),
+                         "result": "skipped_downgrade"})
+            return 0
+
+        if args.check:
+            log("有新包可更新：%s-r%s -> %s-r%s" % (cur_v, cur_r, new_v, new_r), quiet)
+            return 10
+
+        apk_asset = next((a for a in assets if str(a["name"]).endswith(".apk")), None)
+        if not apk_asset:
+            log("最新 release 里没有 .apk 资产，跳过", quiet)
+            return 1
+
+        os.makedirs(PKG_CACHE, exist_ok=True)
+        # 装之前先把「当前版本」的包备进缓存，作为回滚目标（首次更新时缓存里没有旧包）
+        if not ensure_rollback_target(repo, cur_v, cur_r, quiet):
+            log("警告：没有可用的回滚包，本次更新失败将无法自动回退", quiet)
+        dest = cache_path(new_v, new_r)
+        tmp = dest + ".part"
+        log("下载 %s ..." % apk_asset["name"], quiet)
+        try:
+            digest = download_asset(repo, apk_asset, tmp)
+        except Exception as exc:
+            log("下载/校验失败：%s" % exc, quiet)
+            try:
+                os.remove(tmp)          # 别把没校验过的半成品留在缓存里
+            except OSError:
+                pass
+            write_state({"installed": "%s-r%s" % (cur_v, cur_r), "target": tag,
+                         "updated_at": now(), "result": "download_failed",
+                         "detail": str(exc)[:300]})
+            return 1
+        os.replace(tmp, dest)
+        log("已下载并校验 sha256（%s…）" % digest[:16], quiet)
+
+        was_running = service_running()
+        log("安装 %s ..." % os.path.basename(dest), quiet)
+        rc, out = apk_install(dest, allow_untrusted)
+        if rc != 0:
+            log("apk add 失败：%s" % out.strip()[-400:], quiet)
+            write_state({"installed": "%s-r%s" % (cur_v, cur_r), "target": tag,
+                         "updated_at": now(), "result": "install_failed",
+                         "detail": out.strip()[-400:]})
+            return 1
+        prune_cache()
+
+        if was_running:
+            restart_service()
+            if health(port):
+                log("包更新成功：%s-r%s -> %s-r%s，服务健康" % (cur_v, cur_r, new_v, new_r), quiet)
+                write_state({"installed": "%s-r%s" % (new_v, new_r),
+                             "previous": "%s-r%s" % (cur_v, cur_r),
+                             "updated_at": now(), "result": "updated"})
+                return 0
+            log("健康检查失败！自动回滚...", quiet)
+            rollback(port, quiet)
+            v2, r2 = installed_version()
+            write_state({"installed": "%s-r%s" % (v2 or "?", r2 or "?"), "failed": tag,
+                         "updated_at": now(), "result": "rolled_back"})
+            return 1
+
+        log("服务当前未运行，只装了包（下次启动即为 %s-r%s）" % (new_v, new_r), quiet)
+        write_state({"installed": "%s-r%s" % (new_v, new_r),
+                     "previous": "%s-r%s" % (cur_v, cur_r),
+                     "updated_at": now(), "result": "updated_service_stopped"})
+        return 0
+    except Exception as exc:
+        log("包更新过程出错：%r" % (exc,), quiet)
+        return 1
+    finally:
+        try:
+            os.close(lock)
+            os.remove(LOCK_FILE)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(1)

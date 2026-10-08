@@ -26,6 +26,19 @@ config workbuddy2api 'main'
 	# 0 = 关闭自动更新（仍可手动跑 workbuddy2api-update）。
 	option auto_update '1'
 
+	# 整包自动更新：1 = 每天 13:30 检查自己的 fork（下面 pkg_repo）的 wrt-* release，
+	# 有新版就用 apk 安装——服务脚本、默认配置、更新器/预热器本身只有这条链路会更新。
+	# 带 sha256 校验、防降级护栏（包内应用版本低于当前应用文件时不装）、装前备好
+	# 回滚包、健康检查与失败自动回滚（见 /usr/bin/workbuddy2api-pkgupdate --help）。
+	option pkg_auto_update '1'
+
+	# 取包的仓库（fork 的 owner/repo；包发布在 wrt-<应用版本>-<修订> 标签下）
+	option pkg_repo 'aodianjun/workbuddy2api-hub'
+
+	# 1 = apk add 时加 --allow-untrusted。CI 构建的包未签名，必须为 1；
+	# 若哪天改成用自己信任的密钥签名（并把公钥装进 /etc/apk/keys/），可改 0。
+	option pkg_allow_untrusted '1'
+
 	# 统计缓存 TTL（秒，默认 900=15 分钟）。面板每 5 秒轮询一次，而每次缓存
 	# 过期都要全量重扫 usage.jsonl——在这台路由器上 2 万行约 12 秒。应用默认
 	# 15 秒会让进程一直忙于重建（面板卡顿的根因）。默认 900 秒 + 下面的预热器

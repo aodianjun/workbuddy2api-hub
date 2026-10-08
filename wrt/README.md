@@ -18,11 +18,12 @@ wrt/
     ├── build-apk.sh                 # 打包 .apk（apk-tools 3，OpenWrt 25.x），需要 OpenWrt SDK
     └── workbuddy2api/
         ├── Makefile                 # 包定义（PKG_VERSION / PKG_RELEASE / 依赖 / postinst ...）
-        └── files/                   # init.d、uci 配置、自动更新与预热脚本
+        └── files/                   # init.d、uci 配置、应用/整包更新器与预热脚本
 ```
 
 两种包的内容一致：`wb_*.py` + `dashboard.html`（纯 Python 标准库）+
-`/etc/init.d/workbuddy2api` + `/etc/config/workbuddy2api` + `/usr/bin/workbuddy2api-{update,warm}`。
+`/etc/init.d/workbuddy2api` + `/etc/config/workbuddy2api` +
+`/usr/bin/workbuddy2api-{update,pkgupdate,warm}`。
 
 | 产物 | 适用系统 | 安装方式 |
 | --- | --- | --- |
@@ -30,6 +31,38 @@ wrt/
 | `workbuddy2api-<版本>-r<发布号>.apk` | apk-tools 3（OpenWrt 25.x） | `apk add --allow-untrusted <文件>`（未签名时） |
 
 依赖（两套系统同名）：`python3-light`、`python3-urllib`、`python3-uuid`。
+
+## 自动更新（设备侧，两层）
+
+设备装好包之后由 cron 跑两条互相独立的更新链，**分工不同、不要混为一谈**：
+
+| 层 | 脚本 | cron | 来源 | 更新什么 |
+| --- | --- | --- | --- | --- |
+| 应用文件 | `/usr/bin/workbuddy2api-update` | 每天 04:17 | **上游** release（`wb_*.py` + `dashboard.html` 资产） | 只换 `/usr/lib/workbuddy2api` 下的程序文件 |
+| 整包 | `/usr/bin/workbuddy2api-pkgupdate` | 每天 13:30 | **本 fork** 的 `wrt-*` release（`.apk`） | 服务脚本、uci 默认值、更新器/预热器本身——包层面的东西只有这条链路会更新 |
+
+两条链都带：下载校验（整包按 GitHub API 的 `digest` 验 sha256）、健康检查
+（`/health` 200）、失败自动回滚。
+
+`pkgupdate` 另有几点值得注意：
+
+- **走 API 而不是 release 下载页**：`github.com` 直连在部分网络（校园网）不可达，
+  但 `api.github.com` 可达；资产端点 `.../releases/assets/<id>`（`Accept:
+  application/octet-stream`）能正常下载。
+- **防降级护栏**：包会把 `/usr/lib/workbuddy2api` 的应用文件覆盖成「包内版本」，
+  而应用更新器可能已经跑到了更新的版本。tag 里就写着包内应用版本
+  （`wrt-<应用版本>-<发布号>`），若低于当前应用文件版本就跳过不装。
+- **回滚目标预置**：装之前先把「当前已装版本」的 `.apk` 备到
+  `/etc/workbuddy2api/pkgs/`（按 `wrt-<当前版本>` 标签从 release 取），
+  这样首次更新也有回滚包可退。
+- **升级判定不用 `PKG_UPGRADE` 单打独斗**：postinst 里以数据目录
+  `/etc/workbuddy2api` 是否存在作为兜底，避免误判成「首次安装」而把正在跑的
+  服务 disable+stop。
+- uci 开关：`main.pkg_auto_update=0` 关整包更新、`main.pkg_repo` 换取包仓库、
+  `main.pkg_allow_untrusted=0` 在包已签名（公钥在 `/etc/apk/keys/`）时省掉
+  `--allow-untrusted`。
+- 手动：`workbuddy2api-pkgupdate`（检查并更新）、`--check`（只查，有新版退出码 10）、
+  `--force`（重装最新）、`--rollback`（装回上一版）、`--quiet`（只写 syslog）。
 
 ## ⚠ 激活 CI（一次性，需要维护者操作）
 

@@ -24,8 +24,8 @@ set -e
 
 # 上游仓库与钉死的版本（要升级时改这三行，并在 Makefile 里同步 PKG_VERSION）
 UPSTREAM_REPO="ardeyouxipianyi/workbuddy2api-hub"
-PIN_SHA="457e708106f5c780f7a95c90374576eae59d254b"
-PIN_VER="1.6.16"
+PIN_SHA="e4e8e495901fcf9f2d0893cd5fb42c05cc5b7976"
+PIN_VER="1.6.17"
 
 SDK="$1"
 APP_SRC="$2"

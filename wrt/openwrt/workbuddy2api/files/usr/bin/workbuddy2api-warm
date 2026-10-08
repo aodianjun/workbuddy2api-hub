@@ -90,12 +90,19 @@ def main():
         return 1
 
     headers = {"X-Panel-Token": token}
+    # 面板统计页的 5 个轮询接口：/usage 汇总 + 4 个时间窗的 analytics。
+    # timeseries（走势图）也在这里——它同样按时间窗缓存，不预热的话用户隔了
+    # 一个 TTL 再打开统计页，第一眼要等一次全表扫描（实测 2.3s）。
     targets = [
         "/usage?realm=all",
         "/usage/analytics?realm=all&range=today",
         "/usage/analytics?realm=all&range=week",
         "/usage/analytics?realm=all&range=month",
         "/usage/analytics?realm=all&range=all",
+        "/usage/timeseries?realm=all&range=today",
+        "/usage/timeseries?realm=all&range=week",
+        "/usage/timeseries?realm=all&range=month",
+        "/usage/timeseries?realm=all&range=all",
     ]
 
     slow = []
