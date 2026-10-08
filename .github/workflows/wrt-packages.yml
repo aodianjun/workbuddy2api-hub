@@ -179,8 +179,10 @@ jobs:
         run: |
           set -eu
           APP_VER="${{ steps.ver.outputs.app_ver }}"
-          PIN_VER="${{ steps.ver.outputs.pin_ver }}"
-          PKG_VERSION="${{ steps.ver.outputs.pkg_version }}"
+          # 重新读文件里的值（前面的 "Align recipe pins" 已把它们对齐到 APP_VER）；
+          # 不能再用 steps.ver 的输出——那是**对齐之前**读到的旧版本号。
+          PKG_VERSION=$(sed -n 's/^PKG_VERSION:=//p' wrt/openwrt/workbuddy2api/Makefile | head -n1)
+          PIN_VER=$(sed -n 's/^PIN_VER="\([0-9.]*\)".*/\1/p' wrt/openwrt/build-apk.sh | head -n1)
           if [ "$APP_VER" != "$PIN_VER" ] || [ "$APP_VER" != "$PKG_VERSION" ]; then
             echo "::warning::跳过 .ipk 构建：源码版本=$APP_VER，对齐后 PIN_VER=$PIN_VER / PKG_VERSION=$PKG_VERSION 仍不一致（说明对齐步骤没生效）"
             echo "ipk_ok=false" >> "$GITHUB_OUTPUT"
@@ -258,8 +260,10 @@ jobs:
         run: |
           set -eu
           APP_VER="${{ steps.ver.outputs.app_ver }}"
-          PIN_VER="${{ steps.ver.outputs.pin_ver }}"
-          PKG_VERSION="${{ steps.ver.outputs.pkg_version }}"
+          # 重新读文件里的值（前面的 "Align recipe pins" 已把它们对齐到 APP_VER）；
+          # 不能再用 steps.ver 的输出——那是**对齐之前**读到的旧版本号。
+          PKG_VERSION=$(sed -n 's/^PKG_VERSION:=//p' wrt/openwrt/workbuddy2api/Makefile | head -n1)
+          PIN_VER=$(sed -n 's/^PIN_VER="\([0-9.]*\)".*/\1/p' wrt/openwrt/build-apk.sh | head -n1)
           if [ "$APP_VER" != "$PIN_VER" ] || [ "$APP_VER" != "$PKG_VERSION" ]; then
             echo "::warning::跳过 .apk 构建：源码版本=$APP_VER，对齐后 PIN_VER=$PIN_VER / PKG_VERSION=$PKG_VERSION 仍不一致（说明对齐步骤没生效）"
             echo "apk_ok=false" >> "$GITHUB_OUTPUT"
@@ -275,7 +279,7 @@ jobs:
         run: |
           set -eu
           src=$(ls wrt/apk/*.apk | head -n1)
-          dst="wrt/apk/workbuddy2api-${{ steps.ver.outputs.pkg_version }}-r${{ steps.ver.outputs.pkg_release }}.apk"
+          dst="wrt/apk/workbuddy2api-${{ steps.ver.outputs.app_ver }}-r${{ steps.ver.outputs.pkg_release }}.apk"
           if [ "$src" != "$dst" ]; then mv "$src" "$dst"; fi
           ls -l wrt/apk/
 
@@ -360,7 +364,7 @@ jobs:
             {
               echo "WorkBuddy2API-Hub 的 OpenWrt 安装包（由 fork aodianjun/workbuddy2api-hub 的 CI 自动构建）"
               echo ""
-              echo "源码版本：wb-proxy/${{ steps.ver.outputs.app_ver }} · 包版本：${{ steps.ver.outputs.pkg_version }}-${{ steps.ver.outputs.pkg_release }} · 构建自 main@${GITHUB_SHA:0:12}"
+              echo "源码版本：wb-proxy/${{ steps.ver.outputs.app_ver }} · 包版本：${{ steps.ver.outputs.app_ver }}-${{ steps.ver.outputs.pkg_release }} · 构建自 main@${GITHUB_SHA:0:12}"
               echo ""
               echo "## 文件说明"
               if [ -n "$apk_name" ]; then
