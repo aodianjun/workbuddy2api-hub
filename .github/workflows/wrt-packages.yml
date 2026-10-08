@@ -4,8 +4,11 @@ name: wrt-packages
 #   - .ipk（opkg 系，OpenWrt <= 24.10）：wrt/openwrt/build-ipk.sh，纯 POSIX sh + python3，无需 SDK
 #   - .apk（apk-tools 3，OpenWrt 25.x）：wrt/openwrt/build-apk.sh + OpenWrt 25.12.2 x86-64 SDK
 #
-# 版本取自 wb_proxy.py 的 server_version 与 wrt/openwrt/workbuddy2api/Makefile 的
-# PKG_VERSION / PKG_RELEASE，release tag 形如 wrt-1.6.16-1。
+# 版本：release tag 形如 wrt-<源码版本>-<PKG_RELEASE>，其中源码版本取自 wb_proxy.py 的
+# server_version —— 所以上游每发一版、fork 同步过来之后，本工作流就会自动出一个对应的
+# release（幂等：同一版本已发布且资产齐全则跳过）。
+# 构建前会把配方里钉死的版本对齐到当前源码版本（见 "Align recipe pins" 一步）：三个
+# 构建脚本与 Makefile 都要求"源码版本 == 钉死版本"才肯打包，对齐之后才能真正自动跟版。
 #
 # 幂等：tag 已存在且 .apk / .ipk 资产齐全 -> 直接跳过（job 成功退出），重复运行不会
 # 产生重复 release 或重复资产；资产不全时只构建/补传缺失的那部分。
@@ -103,7 +106,7 @@ jobs:
             echo "::error::版本号解析失败（app='$APP_VER' pkg='$PKG_VERSION-$PKG_RELEASE' pin='$PIN_VER'）"
             exit 1
           }
-          TAG="wrt-${PKG_VERSION}-${PKG_RELEASE}"
+          TAG="wrt-${APP_VER}-${PKG_RELEASE}"
           {
             echo "app_ver=$APP_VER"
             echo "pkg_version=$PKG_VERSION"
@@ -112,6 +115,25 @@ jobs:
             echo "tag=$TAG"
           } >> "$GITHUB_OUTPUT"
           echo "app=$APP_VER  Makefile=$PKG_VERSION-$PKG_RELEASE  pin=$PIN_VER  tag=$TAG"
+
+      - name: Align recipe pins to the checked-out source
+        # 配方里钉死的是"构建时"的上游版本；上游发新版、fork 同步过来之后，
+        # 这里把三处钉子对齐到当前源码，构建脚本的版本守卫才会通过，
+        # 否则它们会拒绝打包（这正是"包不跟着上游走"的原因）。
+        run: |
+          set -eu
+          APP_VER="${{ steps.ver.outputs.app_ver }}"
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${APP_VER}/" wrt/openwrt/workbuddy2api/Makefile
+          sed -i "s/^PIN_VER=\".*\"/PIN_VER=\"${APP_VER}\"/" wrt/openwrt/build-apk.sh
+          sed -i "s/^PIN_VER=\".*\"/PIN_VER=\"${APP_VER}\"/" wrt/openwrt/build-ipk.sh
+          sed -i "s/^PIN_SHA=\".*\"/PIN_SHA=\"${GITHUB_SHA}\"/" wrt/openwrt/build-apk.sh
+          echo "对齐后："
+          grep -E '^PKG_VERSION|^PKG_RELEASE' wrt/openwrt/workbuddy2api/Makefile
+          grep -E '^PIN_SHA|^PIN_VER' wrt/openwrt/build-apk.sh wrt/openwrt/build-ipk.sh
+          # 对齐后必须一致，否则脚本仍会拒绝（宁可失败也不要打出标错版本的包）
+          for f in wrt/openwrt/build-apk.sh wrt/openwrt/build-ipk.sh; do
+            grep -q "^PIN_VER=\"${APP_VER}\"" "$f" || { echo "::error::$f 对齐失败"; exit 1; }
+          done
 
       - name: Check release exists (idempotence)
         id: rel
@@ -158,7 +180,7 @@ jobs:
           PIN_VER="${{ steps.ver.outputs.pin_ver }}"
           PKG_VERSION="${{ steps.ver.outputs.pkg_version }}"
           if [ "$APP_VER" != "$PIN_VER" ] || [ "$APP_VER" != "$PKG_VERSION" ]; then
-            echo "::warning::跳过 .ipk 构建：源码版本=$APP_VER，build-ipk.sh 的 PIN_VER=$PIN_VER，Makefile PKG_VERSION=$PKG_VERSION（三者需一致，脚本会拒绝打包不一致的版本）。升级时请同步修改脚本顶部 PIN_SHA/PIN_VER 与 Makefile。"
+            echo "::warning::跳过 .ipk 构建：源码版本=$APP_VER，对齐后 PIN_VER=$PIN_VER / PKG_VERSION=$PKG_VERSION 仍不一致（说明对齐步骤没生效）"
             echo "ipk_ok=false" >> "$GITHUB_OUTPUT"
           elif sh wrt/openwrt/build-ipk.sh --app-src "$GITHUB_WORKSPACE"; then
             echo "ipk_ok=true" >> "$GITHUB_OUTPUT"
@@ -217,7 +239,7 @@ jobs:
           PIN_VER="${{ steps.ver.outputs.pin_ver }}"
           PKG_VERSION="${{ steps.ver.outputs.pkg_version }}"
           if [ "$APP_VER" != "$PIN_VER" ] || [ "$APP_VER" != "$PKG_VERSION" ]; then
-            echo "::warning::跳过 .apk 构建：源码版本=$APP_VER，build-apk.sh 的 PIN_VER=$PIN_VER，Makefile PKG_VERSION=$PKG_VERSION（三者需一致，脚本会拒绝打包不一致的版本）。升级时请同步修改脚本顶部 PIN_SHA/PIN_VER 与 Makefile。"
+            echo "::warning::跳过 .apk 构建：源码版本=$APP_VER，对齐后 PIN_VER=$PIN_VER / PKG_VERSION=$PKG_VERSION 仍不一致（说明对齐步骤没生效）"
             echo "apk_ok=false" >> "$GITHUB_OUTPUT"
           elif sh wrt/openwrt/build-apk.sh "$SDK_DIR"; then
             echo "apk_ok=true" >> "$GITHUB_OUTPUT"
