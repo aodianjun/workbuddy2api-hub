@@ -97,6 +97,14 @@ def main():
     # 的话，面板闲置一会儿后第一次打开就要等一次全表扫描（实测 3~7s）。
     targets = [
         "/usage?realm=all",
+        # 统计页的矩阵表用的是带 range 的这两条（loadAnalyticsMatrix），不预热的话
+        # 「闲置一会儿后第一次切本周/本月」要等一次全表扫描（前端剖析实测 9~11s）。
+        "/usage?realm=all&range=today",
+        "/usage?realm=all&range=week",
+        "/usage?realm=all&range=month",
+        "/usage/perf?realm=all&range=today",
+        "/usage/perf?realm=all&range=week",
+        "/usage/perf?realm=all&range=month",
         "/usage/analytics?realm=all&range=today",
         "/usage/analytics?realm=all&range=week",
         "/usage/analytics?realm=all&range=month",
