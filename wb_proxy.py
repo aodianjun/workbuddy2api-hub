@@ -47,6 +47,7 @@ import urllib.error
 import urllib.request
 import uuid
 import wb_accounts
+import wb_activity
 import wb_atrest
 import wb_catalog
 import wb_ipintel
@@ -57,6 +58,8 @@ import wb_identity
 import wb_prompt
 import wb_modelsdev
 import wb_probes
+import wb_updates
+import wb_agents
 IS_WINDOWS = os.name == "nt"
 def launcher_hint(port):
     """Platform-appropriate launcher command for starting on another port."""
@@ -1628,6 +1631,8 @@ POOL = None
 SCHEDULER = None
 PRICING = None
 CREDITS_REFRESHER = None
+# Release discovery only - the checker never downloads or installs anything.
+UPDATES = None
 ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts')
 def realm_state_file():
     """Path of the persisted realm switch.
@@ -2344,11 +2349,14 @@ def runtime_settings_view():
         "model_daily_token_limit": wb_settings.model_daily_token_limit(ACCOUNTS_DIR),
         "pricing_refresh_minutes": wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR),
         "credits_refresh_hours": wb_settings.credits_refresh_hours(ACCOUNTS_DIR),
+        "ui_language": wb_settings.ui_language(ACCOUNTS_DIR),
         "pricing_variant_inherit": wb_settings.pricing_variant_inherit(ACCOUNTS_DIR),
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
+        "accounts_collapsed": wb_settings.accounts_collapsed(ACCOUNTS_DIR),
+        "update_check_enabled": wb_settings.update_check_enabled(ACCOUNTS_DIR),
         "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
         "prompt": wb_settings.prompt_config(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
@@ -7470,9 +7478,13 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/usage") or path.startswith("/v1/usage"):
             return True
+        if path.startswith("/activity"):
+            return True
         if path.startswith("/tasks") or path.startswith("/scheduler"):
             return True
         if path.startswith("/settings"):
+            return True
+        if path.startswith("/updates"):
             return True
         if path.startswith("/logs"):
             return True
@@ -7481,6 +7493,8 @@ class Handler(BaseHTTPRequestHandler):
         # /pricing/mapping) were already panel-only, and the read side returns
         # the same management state plus resolved project-local file paths.
         if path.startswith("/pricing"):
+            return True
+        if path.startswith("/agents"):
             return True
         return False
     def do_OPTIONS(self):
@@ -7529,6 +7543,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_usage_perf(query)
         if path == "/usage/timeseries":
             return self._get_usage_timeseries(query)
+        if path == "/activity/history":
+            return self._get_activity_history(query)
         if path == "/tasks":
             return self._get_tasks(query)
         if path == "/scheduler":
@@ -7537,6 +7553,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_pricing()
         if path == "/settings":
             return self._get_settings()
+        if path == "/updates":
+            return self._get_updates()
         if path == "/proxy/slots":
             if not self._panel_ok():
                 return self._error(
@@ -7549,6 +7567,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_logs_export()
         if path == "/settings/reveal":
             return self._get_settings_reveal(query)
+        if path == "/agents":
+            return self._get_agents()
         return self._error(404, "not found", "invalid_request_error")
     def _get_dashboard(self):
         return self._dashboard()
@@ -7632,6 +7652,29 @@ class Handler(BaseHTTPRequestHandler):
             page = 1
         req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
         return self._json(200, recent_usage(limit, realm=req_realm, page=page))
+
+    def _get_activity_history(self, query):
+        """账号每日活动的结构化历史（issue #34）。只读，供面板的签到记录用。
+
+        筛选条件写错时返回 400 而不是静默忽略：调用方拿着一个被忽略的
+        result=failed 会以为「这几天没有失败」，实际上它拿回的是全部结果。
+        """
+        if not self._authorized():
+            return
+
+        def first(name):
+            values = query.get(name) or [""]
+            return (values[0] if values else "") or ""
+
+        try:
+            payload = wb_activity.query(range_key=first("range") or None,
+                                        uid=first("uid"),
+                                        task=first("task"),
+                                        result=first("result"),
+                                        limit=first("limit") or None)
+        except ValueError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        return self._json(200, payload)
 
     def _get_accounts_credits(self):
         if not self._authorized():
@@ -7825,6 +7868,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self._json(200, runtime_settings_view())
 
+    def _get_updates(self):
+        """What the running build is, and whether a newer stable release exists.
+
+        Read-only and cheap: it reports the last check's outcome, never runs
+        one. The panel's "check now" is the POST below.
+        """
+        if not self._authorized():
+            return
+        if UPDATES:
+            return self._json(200, UPDATES.status())
+        return self._json(200, {
+            "current_version": running_version(),
+            "latest_version": None, "update_available": False,
+            "enabled": wb_settings.update_check_enabled(ACCOUNTS_DIR),
+            "checking": False, "last_attempt": None, "last_success": None,
+            "last_error": "", "release_url": "", "published_at": "",
+            "msg": "更新检查未运行",
+        })
+
     def _get_logs(self, query):
         if not self._authorized():
             return
@@ -7875,6 +7937,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = fh.read()
         except Exception as exc:
             return self._error(500, f"dashboard.html unavailable: {exc}")
+        # The static file carries a placeholder; replace it with the instance
+        # default so the first paint already uses the right language.
+        language = wb_settings.ui_language(ACCOUNTS_DIR)
+        body = body.replace(
+            b'data-ui-language="__WB_UI_LANGUAGE__"',
+            ('data-ui-language="%s"' % language).encode("utf-8"),
+        )
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -8197,6 +8266,15 @@ class Handler(BaseHTTPRequestHandler):
                 wb_settings.set_credits_refresh_hours(ACCOUNTS_DIR, hours)
             if CREDITS_REFRESHER:
                 CREDITS_REFRESHER.wake()
+        if "ui_language" in payload:
+            # Instance-wide default language. The dashboard overrides this per
+            # browser with localStorage; this value is the fallback when no
+            # browser-local preference exists.
+            raw = payload.get("ui_language")
+            if not isinstance(raw, str) or raw not in ("zh", "zh-Hant", "en"):
+                return self._error(400, "ui_language must be zh, zh-Hant or en",
+                                   "invalid_request_error")
+            reply["ui_language"] = wb_settings.set_ui_language(ACCOUNTS_DIR, raw)
         if "pricing_variant_inherit" in payload:
             # Strictly a JSON boolean, like the other switches: "false" as a
             # string would be truthy and silently keep the feature on.
@@ -8238,6 +8316,28 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_local_web_tools(ACCOUNTS_DIR, raw)
             reply["local_web_tools"] = raw
+        if "accounts_collapsed" in payload:
+            # A disclosure state, and the only thing this branch may touch: the
+            # submission carries just this key, so the settings it does not name
+            # survive the write.
+            raw = payload.get("accounts_collapsed")
+            if not isinstance(raw, bool):
+                return self._error(400, "accounts_collapsed must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_accounts_collapsed(ACCOUNTS_DIR, raw)
+            reply["accounts_collapsed"] = raw
+        if "update_check_enabled" in payload:
+            # Strictly a JSON boolean, like the switches above: "false" as a
+            # string would be truthy and silently start the daily GitHub call.
+            raw = payload.get("update_check_enabled")
+            if not isinstance(raw, bool):
+                return self._error(400, "update_check_enabled must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_update_check_enabled(ACCOUNTS_DIR, raw)
+            reply["update_check_enabled"] = raw
+            if UPDATES and raw:
+                # Turning it on should not wait out the rest of the poll sleep.
+                UPDATES.wake()
         if "upstream" in payload:
             raw = payload.get("upstream")
             if not isinstance(raw, dict):
@@ -8355,6 +8455,194 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/proxy/discover":
             return self._json(200, {"candidates": discover_proxy_slots()})
         return self._error(404, "not found", "invalid_request_error")
+
+    # ---- one-click agent integration (wb_agents) ----
+
+    def _agents_base_url_hint(self):
+        """Best guess at the URL a local client should point at.
+
+        Derived from the bound socket; a 0.0.0.0 bind is unreachable for a
+        client, so it is reported as 127.0.0.1 instead.
+        """
+        host, port = "", 0
+        try:
+            host, port = self.server.server_address[:2]
+        except Exception:
+            pass
+        host = str(host or "").strip() or "127.0.0.1"
+        if host in ("0.0.0.0", "::", ""):
+            host = "127.0.0.1"
+        return "http://%s:%d/v1" % (host, int(port or 0))
+
+    def _agents_models(self):
+        """Flat model list for the picker; bundled intl+cn catalog, deduped.
+
+        Live sources stay out of this path on purpose: the panel must answer
+        even when the upstream is down, so a failure here is simply a shorter
+        list, never an error.
+        """
+        models = []
+        seen = set()
+        try:
+            try:
+                entries = fetch_models()
+            except Exception:
+                entries = []
+            if entries:
+                sources = ((mid, meta) for mid, meta in entries)
+            else:
+                sources = (
+                    (item.get("id"), item)
+                    for item in (list(getattr(wb_catalog, "STATIC_INTL_MODELS", []))
+                                 + list(getattr(wb_catalog, "STATIC_CN_MODELS", [])))
+                    if isinstance(item, dict)
+                )
+            for mid, meta in sources:
+                mid = str(mid or "").strip()
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                meta = meta if isinstance(meta, dict) else {}
+                entry = {"id": mid}
+                ctx = meta.get("maxInputTokens")
+                window = meta.get("contextWindow")
+                if isinstance(window, dict) and window.get("defaultLength"):
+                    ctx = window.get("defaultLength")
+                if not ctx and isinstance(window, dict):
+                    lengths = window.get("supportedLengths") or []
+                    ctx = lengths[-1] if lengths else None
+                if ctx:
+                    try:
+                        entry["context_window"] = int(ctx)
+                    except (TypeError, ValueError):
+                        pass
+                out = meta.get("maxOutputTokens")
+                if out:
+                    try:
+                        entry["max_output"] = int(out)
+                    except (TypeError, ValueError):
+                        pass
+                name = meta.get("name")
+                if name:
+                    entry["name"] = name
+                models.append(entry)
+        except Exception:
+            pass
+        return models
+
+    def _get_agents(self):
+        keys = []
+        try:
+            for entry in configured_keys():
+                if entry.get("enabled"):
+                    keys.append({
+                        "id": entry.get("id"),
+                        "name": entry.get("name") or "",
+                        "enabled": True,
+                    })
+        except Exception:
+            keys = []
+        return self._json(200, {
+            "clients": list(wb_agents.overview(ACCOUNTS_DIR).values()),
+            "models": self._agents_models(),
+            "keys": keys,
+            "global_key_set": bool(API_KEY),
+            "auth_required": auth_required(),
+            "gateway": {"base_url": self._agents_base_url_hint()},
+        })
+
+    def _agents_resolve_key(self, payload, warnings):
+        """Pick the gateway key to hand to the client, per the payload.
+
+        Returns the key string, or None when the request should fail. The
+        failure message is appended to `warnings` only for the soft-fallback
+        case; hard failures raise via the caller's 400 mapping.
+        """
+        key_id = str(payload.get("key_id") or "").strip()
+        if key_id == "__global":
+            return API_KEY or None
+        keys = configured_keys()
+        if key_id:
+            for entry in keys:
+                if entry.get("id") == key_id:
+                    return entry.get("key") or None
+            raise wb_agents.AgentConfigError(
+                "no configured key with id %r" % key_id)
+        # Default: the global key when set, else the first enabled panel key.
+        if API_KEY:
+            return API_KEY
+        for entry in keys:
+            if entry.get("enabled"):
+                return entry.get("key") or None
+        return None
+
+    def _handle_agents_apply(self, payload):
+        client_id = str(payload.get("client") or payload.get("client_id") or "").strip()
+        if not client_id:
+            return self._error(400, "client is required", "invalid_request_error")
+        base_url = str(payload.get("base_url") or "").strip()
+        if not re.match(r"^https?://", base_url):
+            return self._error(
+                400, "base_url must start with http:// or https://",
+                "invalid_request_error")
+        model = str(payload.get("model") or "").strip() or None
+        models = payload.get("models")
+        if not models:
+            # Fall back to the gateway's discovered catalog so clients that embed
+            # model definitions (OpenCode, DSH, Crush) receive the full model list
+            # even when the front-end omitted the field.
+            models = self._agents_models()
+        if not isinstance(models, list):
+            return self._error(400, "models must be a list",
+                               "invalid_request_error")
+        # A runaway picker must not turn into a megabyte config file.
+        models = models[:80]
+        cleaned_models = []
+        for item in models:
+            if isinstance(item, dict) and item.get("id"):
+                cleaned_models.append(item)
+            elif isinstance(item, str) and item.strip():
+                cleaned_models.append({"id": item.strip()})
+        warnings = []
+        try:
+            api_key = self._agents_resolve_key(payload, warnings)
+        except wb_agents.AgentConfigError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        if not api_key:
+            if auth_required():
+                return self._error(
+                    400, "no gateway key available - 请先配置 API Key",
+                    "invalid_request_error")
+            api_key = "wb-local"
+            warnings.append("gateway has no key configured; wrote placeholder "
+                            "'wb-local' (auth is off, so any value works)")
+        try:
+            result = wb_agents.integrate(
+                ACCOUNTS_DIR, client_id, base_url, api_key,
+                model=model, models=cleaned_models)
+        except wb_agents.AgentConfigError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            return self._error(500, "agents apply failed: %s" % exc)
+        result["warnings"] = warnings
+        log("agents apply: client=%s base_url=%s model=%s files=%d"
+            % (client_id, base_url, model or "-", len(result.get("files") or [])),
+            tag="agents")
+        return self._json(200, result)
+
+    def _handle_agents_restore(self, payload):
+        client_id = str(payload.get("client") or payload.get("client_id") or "").strip()
+        if not client_id:
+            return self._error(400, "client is required", "invalid_request_error")
+        try:
+            result = wb_agents.restore(ACCOUNTS_DIR, client_id)
+        except wb_agents.AgentConfigError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            return self._error(500, "agents restore failed: %s" % exc)
+        log("agents restore: client=%s files=%d"
+            % (client_id, len(result.get("restored") or [])), tag="agents")
+        return self._json(200, result)
 
     def _handle_panel(self, path):
         """Panel login, logout and the settings screen (password + API key)."""
@@ -8636,6 +8924,19 @@ class Handler(BaseHTTPRequestHandler):
             "accounts_count": len(targets)
         })
 
+    def _route_update_check(self):
+        """Run one release check now, on the operator's explicit request.
+
+        Inline rather than "started, poll /updates": it is a single bounded
+        GitHub request, and the answer is what the button is for. `manual=True`
+        ignores both the daily switch and the 24h window.
+        """
+        if not UPDATES:
+            return self._json(200, {"ok": False, "msg": "更新检查未运行"})
+        status = UPDATES.check(manual=True)
+        status["ok"] = True
+        return self._json(200, status)
+
     def _route_scheduler_trigger(self, payload):
         if SCHEDULER:
             return self._json(200, SCHEDULER.trigger_now())
@@ -8727,7 +9028,7 @@ class Handler(BaseHTTPRequestHandler):
         for account in targets:
             if account is None:
                 continue
-            res = account.checkin()
+            res = account.checkin(trigger="manual")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
         return self._json(200, {"results": results, "accounts": account_views()})
 
@@ -8741,7 +9042,7 @@ class Handler(BaseHTTPRequestHandler):
         for account in targets:
             if account is None:
                 continue
-            res = account.daily_chat()
+            res = account.daily_chat(trigger="manual")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
         return self._json(200, {"results": results, "accounts": account_views()})
 
@@ -8760,7 +9061,7 @@ class Handler(BaseHTTPRequestHandler):
         for account in targets:
             if account is None:
                 continue
-            res = account.daily_chat_web()
+            res = account.daily_chat_web(trigger="manual")
             log("account %s: 网页通道打卡 -> %s"
                 % (account.uid[:8], res.get("conversation") if res.get("ok") else res.get("error")),
                 level="INFO" if res.get("ok") else "WARN")
@@ -9420,6 +9721,13 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/updates/check":
+            # Panel-only management write, like the pricing ones. No body to
+            # read: the action takes no parameters, so a button that posts
+            # nothing must not be answered with "invalid JSON body".
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._route_update_check()
         if path in ("/pricing/refresh", "/pricing/mapping"):
             # Panel-only management writes (the pricing table is the panel's
             # own view of the estimate). Registered here because the generic
@@ -9443,6 +9751,17 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             return self._handle_proxy_slots(path, payload)
+        if path in ("/agents/apply", "/agents/restore"):
+            if not self._panel_ok():
+                return self._error(
+                    401, "panel password required", "invalid_request_error"
+                )
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            if path == "/agents/apply":
+                return self._handle_agents_apply(payload)
+            return self._handle_agents_restore(payload)
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
@@ -9688,6 +10007,15 @@ class Handler(BaseHTTPRequestHandler):
                      fp=fp, account=account.uid, key=self._key_id(), effort=effort)
         return self._json(200, result)
 
+def running_version():
+    """The version this process reports, e.g. "1.6.17".
+
+    tests/_test_release_engineering.py pins the two version literals and asserts
+    they agree, so the update checker reads the running one from the handler
+    instead of becoming a third copy that could drift away from both.
+    """
+    return Handler.server_version.split("/", 1)[-1]
+
 def main():
     args = _parse_cli_args()
     _apply_cli_overrides(args)
@@ -9737,6 +10065,9 @@ def _apply_cli_overrides(args):
     if args.usage_dir:
         USAGE_DIR = os.path.abspath(args.usage_dir)
         USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
+    # 账号活动历史与用量日志同目录，并且要在任何后台线程起来之前定下来：调度器
+    # 的第一轮巡检不能落在 --usage-dir 生效之前，否则记录会写进默认目录。
+    wb_activity.set_data_dir(USAGE_DIR)
 
 def _probe_running_instance(args):
     # Refuse to start a second copy. On Windows SO_REUSEADDR lets two sockets
@@ -9843,6 +10174,16 @@ def _bootstrap_runtime(args):
     global CREDITS_REFRESHER
     CREDITS_REFRESHER = wb_accounts.CreditsRefresher(POOL)
     CREDITS_REFRESHER.start()
+    global UPDATES
+    # Release discovery only: the checker asks GitHub what the newest stable
+    # release is and reports it. It never downloads, replaces or restarts
+    # anything, and with the daily switch off (the default) it sends nothing.
+    UPDATES = wb_updates.UpdateChecker(
+        current_version=running_version(),
+        settings_dir=ACCOUNTS_DIR,
+        log=lambda msg: add_log_entry("[更新] %s" % msg, tag="update"),
+    )
+    UPDATES.start()
     return api_key_generated
 
 def _report_first_run(args):
